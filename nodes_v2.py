@@ -21,12 +21,8 @@ try:
 except:
     pass
 
-from transformers import (
-    CLIPTextModel,
-    CLIPTokenizer,
-    CLIPTextConfig,
+from transformers import CLIPTextModel,CLIPTokenizer, CLIPTextConfig
 
-)
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 def dummy_build_vision_tower(*args, **kwargs):
@@ -46,15 +42,15 @@ def patch_build_vision_tower():
 def build_text_model_from_openai_state_dict(
         state_dict: dict,
         device,
-        cast_dtype=torch.float16,    
+        cast_dtype=torch.float16,
     ):
-   
+
     embed_dim = state_dict["text_projection"].shape[1]
     context_length = state_dict["positional_embedding"].shape[0]
     vocab_size = state_dict["token_embedding.weight"].shape[0]
     transformer_width = state_dict["ln_final.weight"].shape[0]
     transformer_heads = transformer_width // 64
-    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
+    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
 
     vision_cfg = None
     text_cfg = open_clip.CLIPTextCfg(
@@ -180,7 +176,10 @@ class SUPIR_decode:
             "latents": ("LATENT",),
             "use_tiled_vae": ("BOOLEAN", {"default": True}),
             "decoder_tile_size": ("INT", {"default": 512, "min": 64, "max": 8192, "step": 64}),
-            }
+        },
+            "optional": {
+                    "decoder_dtype": (['bf16', 'fp32', 'auto'], {"default": 'auto'}),
+                }
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -188,18 +187,31 @@ class SUPIR_decode:
     FUNCTION = "decode"
     CATEGORY = "SUPIR"
 
-    def decode(self, SUPIR_VAE, latents, use_tiled_vae, decoder_tile_size):
+    def decode(self, SUPIR_VAE, latents, use_tiled_vae, decoder_tile_size, decoder_dtype="auto"):
         device = mm.get_torch_device()
         mm.unload_all_models()
         samples = latents["samples"]
-        dtype = SUPIR_VAE.dtype
-        orig_H, orig_W = latents["original_size"]
-        
+
         B, H, W, C = samples.shape
-                
+
         pbar = comfy.utils.ProgressBar(B)
-  
-        SUPIR_VAE.to(device)
+
+        if decoder_dtype == 'auto':
+            try:
+                if mm.should_use_bf16():
+                    print("Decoder using bf16")
+                    vae_dtype = 'bf16'
+                else:
+                    print("Decoder using fp32")
+                    vae_dtype = 'fp32'
+            except:
+                raise AttributeError("ComfyUI version too old, can't autodetect properly. Set your dtypes manually.")
+        else:
+            vae_dtype = decoder_dtype
+            print(f"Decoder using {vae_dtype}")
+
+        dtype = convert_dtype(vae_dtype)
+        SUPIR_VAE.to(dtype).to(device)
         samples = samples.to(device)
 
         if use_tiled_vae:
@@ -220,14 +232,17 @@ class SUPIR_decode:
             autocast_condition = (dtype != torch.float32) and not comfy.model_management.is_device_mps(device)
             with torch.autocast(comfy.model_management.get_autocast_device(device), dtype=dtype) if autocast_condition else nullcontext():
                 sample = 1.0 / 0.13025 * sample
-                decoded_image = SUPIR_VAE.decode(sample.unsqueeze(0)).float()
+                decoded_image = SUPIR_VAE.decode(sample.unsqueeze(0))
                 out.append(decoded_image)
                 pbar.update(1)
 
-        decoded_out= torch.cat(out, dim=0)
-        if decoded_out.shape[2] != orig_H or decoded_out.shape[3] != orig_W:
-            print("Restoring original dimensions: ", orig_W,"x",orig_H)
-            decoded_out = F.interpolate(decoded_out, size=(orig_H, orig_W), mode="bicubic")
+        decoded_out= torch.cat(out, dim=0).float()
+
+        if "original_size" in latents and latents["original_size"] is not None:
+            orig_H, orig_W = latents["original_size"]
+            if decoded_out.shape[2] != orig_H or decoded_out.shape[3] != orig_W:
+                print("Restoring original dimensions: ", orig_W,"x",orig_H)
+                decoded_out = F.interpolate(decoded_out, size=(orig_H, orig_W), mode="bicubic")
 
         decoded_out = torch.clip(decoded_out, 0, 1)
         decoded_out = decoded_out.cpu().to(torch.float32).permute(0, 2, 3, 1)
@@ -360,9 +375,9 @@ class SUPIR_sample:
             "EDM_s_churn": ("INT", {"default": 5, "min": 0, "max": 40, "step": 1}),
             "s_noise": ("FLOAT", {"default": 1.003, "min": 1.0, "max": 1.1, "step": 0.001}),
             "DPMPP_eta": ("FLOAT", {"default": 1.0, "min": 0, "max": 10.0, "step": 0.01}),
-            "control_scale_start": ("FLOAT", {"default": 1.0, "min": 0, "max": 10.0, "step": 0.05}),
-            "control_scale_end": ("FLOAT", {"default": 1.0, "min": 0, "max": 10.0, "step": 0.05}),
-            "restore_cfg": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 20.0, "step": 0.05}),
+            "control_scale_start": ("FLOAT", {"default": 1.0, "min": 0, "max": 10.0, "step": 0.01}),
+            "control_scale_end": ("FLOAT", {"default": 1.0, "min": 0, "max": 10.0, "step": 0.01}),
+            "restore_cfg": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 20.0, "step": 0.01}),
             "keep_model_loaded": ("BOOLEAN", {"default": False}),
             "sampler": (
                     [
@@ -483,7 +498,8 @@ SUPIR Tiles -node for preview to understand how the image is tiled.
                     noised_z = torch.randn_like(sample.unsqueeze(0), device=samples.device)
                 else:
                     print("Using latent from input")
-                    noised_z = sample.unsqueeze(0) * 0.13025
+                    noised_z = torch.randn_like(sample.unsqueeze(0), device=samples.device)
+                    noised_z += sample.unsqueeze(0)
                 if len(positive) != len(samples):
                     print("Tiled sampling")
                     _samples = self.sampler(denoiser, noised_z, cond=positive, uc=negative, x_center=sample.unsqueeze(0), control_scale=control_scale_end,
@@ -494,7 +510,8 @@ SUPIR Tiles -node for preview to understand how the image is tiled.
                     _samples = self.sampler(denoiser, noised_z, cond=positive[i], uc=negative[i], x_center=sample.unsqueeze(0), control_scale=control_scale_end,
                                             use_linear_control_scale=use_linear_control_scale, control_scale_start=control_scale_start)
 
-                
+
+
             except torch.cuda.OutOfMemoryError as e:
                 mm.free_memory(mm.get_total_memory(mm.get_torch_device()), mm.get_torch_device())
                 SUPIR_model = None
@@ -517,6 +534,9 @@ SUPIR Tiles -node for preview to understand how the image is tiled.
             samples_out_stacked = torch.cat(out, dim=0)
         else:
             samples_out_stacked = torch.stack(out, dim=0)
+
+        if original_size is None:
+            samples_out_stacked = samples_out_stacked / 0.13025
 
         return ({"samples":samples_out_stacked, "original_size": original_size},)
 
@@ -555,7 +575,14 @@ If a list of captions is given and it matches the incoming image batch, each ima
         
         device = mm.get_torch_device()
         mm.soft_empty_cache()
-        samples = latents["samples"]
+
+        if "original_size" in latents:
+            original_size = latents["original_size"]
+            samples = latents["samples"]
+        else:
+            original_size = None
+            samples = latents["samples"] * 0.13025
+        
         N, H, W, C = samples.shape
         import copy
 
@@ -622,8 +649,13 @@ If a list of captions is given and it matches the incoming image batch, each ima
 
             
         SUPIR_model.conditioner.to('cpu')
+
+        if "original_size" in latents:
+            original_size = latents["original_size"]
+        else:
+            original_size = None
                 
-        return ({"cond": c, "original_size":latents["original_size"]}, {"uncond": uc},)
+        return ({"cond": c, "original_size":original_size}, {"uncond": uc},)
     
 class SUPIR_model_loader:
     @classmethod
@@ -877,12 +909,11 @@ high_vram: uses Accelerate to load weights to GPU, slightly faster model loading
             try:
                 print(f"Attempting to load SDXL model from node inputs")
                 mm.load_model_gpu(model)
-                sdxl_state_dict = model.model.state_dict_for_saving(None, vae.get_sd(), None)
-                if is_accelerate_available:
-                    for key in sdxl_state_dict:
-                        set_module_tensor_to_device(self.model, key, device=device, dtype=dtype, value=sdxl_state_dict[key])
-                else:
-                    self.model.load_state_dict(sdxl_state_dict, strict=False)
+                try:
+                    sdxl_state_dict = model.model.state_dict_for_saving(model.model.diffusion_model.state_dict(), vae_state_dict=vae.get_sd())
+                except:
+                    sdxl_state_dict = model.model.state_dict_for_saving(None, vae.get_sd(), None)
+                self.model.load_state_dict(sdxl_state_dict, strict=False)
                 if fp8_unet:
                     self.model.model.to(torch.float8_e4m3fn)
                 else:
@@ -890,7 +921,7 @@ high_vram: uses Accelerate to load weights to GPU, slightly faster model loading
                 del sdxl_state_dict
                 pbar.update(1)
             except:
-                raise Exception("Failed to load SDXL model")            
+                raise Exception("Failed to load SDXL model")
             gc.collect()
             mm.soft_empty_cache()
             #first clip model from SDXL checkpoint
@@ -942,11 +973,7 @@ high_vram: uses Accelerate to load weights to GPU, slightly faster model loading
             try:
                 print(f'Attempting to load SUPIR model: [{SUPIR_MODEL_PATH}]')
                 supir_state_dict = load_state_dict(SUPIR_MODEL_PATH)
-                if "Q" not in supir_model or not is_accelerate_available: #I don't know why this doesn't work with the Q model. 
-                    for key in supir_state_dict:
-                        set_module_tensor_to_device(self.model, key, device=device, dtype=dtype, value=supir_state_dict[key])
-                else:
-                    self.model.load_state_dict(supir_state_dict, strict=False)
+                self.model.load_state_dict(supir_state_dict, strict=False)
                 if fp8_unet:
                     self.model.model.to(torch.float8_e4m3fn)
                 else:
@@ -958,7 +985,7 @@ high_vram: uses Accelerate to load weights to GPU, slightly faster model loading
             mm.soft_empty_cache()
 
         return (self.model, self.model.first_stage_model,)
-    
+
 class SUPIR_model_loader_v2_clip:
     @classmethod
     def INPUT_TYPES(s):
@@ -1060,12 +1087,11 @@ high_vram: uses Accelerate to load weights to GPU, slightly faster model loading
             try:
                 print(f"Attempting to load SDXL model from node inputs")
                 mm.load_model_gpu(model)
-                sdxl_state_dict = model.model.state_dict_for_saving(None, vae.get_sd(), None)
-                if is_accelerate_available:
-                    for key in sdxl_state_dict:
-                        set_module_tensor_to_device(self.model, key, device=device, dtype=dtype, value=sdxl_state_dict[key])
-                else:
-                    self.model.load_state_dict(sdxl_state_dict, strict=False)
+                try:
+                    sdxl_state_dict = model.model.state_dict_for_saving(model.model.diffusion_model.state_dict(), vae_state_dict=vae.get_sd())
+                except:
+                    sdxl_state_dict = model.model.state_dict_for_saving(None, vae.get_sd(), None)
+                self.model.load_state_dict(sdxl_state_dict, strict=False)
                 if fp8_unet:
                     self.model.model.to(torch.float8_e4m3fn)
                 else:
@@ -1073,7 +1099,7 @@ high_vram: uses Accelerate to load weights to GPU, slightly faster model loading
                 del sdxl_state_dict
                 pbar.update(1)
             except:
-                raise Exception("Failed to load SDXL model")            
+                raise Exception("Failed to load SDXL model")
             gc.collect()
             mm.soft_empty_cache()
             #first clip model from SDXL checkpoint
@@ -1131,11 +1157,7 @@ high_vram: uses Accelerate to load weights to GPU, slightly faster model loading
             try:
                 print(f'Attempting to load SUPIR model: [{SUPIR_MODEL_PATH}]')
                 supir_state_dict = load_state_dict(SUPIR_MODEL_PATH)
-                if "Q" not in supir_model or not is_accelerate_available: #I don't know why this doesn't work with the Q model. 
-                    for key in supir_state_dict:
-                        set_module_tensor_to_device(self.model, key, device=device, dtype=dtype, value=supir_state_dict[key])
-                else:
-                    self.model.load_state_dict(supir_state_dict, strict=False)
+                self.model.load_state_dict(supir_state_dict, strict=False)
                 if fp8_unet:
                     self.model.model.to(torch.float8_e4m3fn)
                 else:
